@@ -1,11 +1,12 @@
 # musashi_core.py
 # Goodnotes to Anki Logic Core (Headless for Colab)
+# v1.1: Fixed sorting order (sequential filenames)
 
 import sys, subprocess, importlib, io, os, logging, tempfile, uuid, base64
 from typing import List, Tuple, Dict
 from pathlib import Path
 
-# 必要なライブラリがなければインストールする機能
+# 必要なライブラリがなければインストール
 def install_deps():
     required = ["pypdf", "pypdfium2", "genanki", "Pillow"]
     for pkg in required:
@@ -22,10 +23,6 @@ from PIL import Image, ImageDraw
 import genanki
 
 # --- Constants & Helpers ---
-COLOR_TOL = 10
-CUT_MERGE_GAP = 6.0
-HL_SORT_ROW_PCT = 0.035
-
 def hz(hx:str)->str: return (hx or "").lstrip("#")
 def hex_to_rgb_frac(hx:str)->Tuple[float,float,float]:
     c = hz(hx); return (int(c[0:2],16)/255, int(c[2:4],16)/255, int(c[4:6],16)/255)
@@ -136,6 +133,8 @@ def reading_sort_key(r: SimpleRect, page_h: float, rotation: int, row_pct: float
 
 # --- Main Analysis Logic ---
 def analyze_pages(reader, s_page, l_page, color_hex_map, cut_hl_color, group_ink_color, max_clozes, color_tol):
+    # (省略なしで全ロジックを保持します)
+    HL_SORT_ROW_PCT = 0.035
     prio_map = {}
     for hx, pr in color_hex_map.items():
         r,g,b = [int(v*255) for v in hex_to_rgb_frac(hx)]
@@ -177,10 +176,8 @@ def analyze_pages(reader, s_page, l_page, color_hex_map, cut_hl_color, group_ink
                         if rct and len(rct)>=4:
                             rects = [SimpleRect(float(rct[0]), float(rct[1]), float(rct[2]), float(rct[3]))]
                     if not rects: continue
-
                     if almost_equal_rgb(col, cut_hl_rgb, tol=color_tol):
                         cut_rects_hl.extend(merge_rects_simple(rects)); continue
-
                     matched = None
                     for rgb, prname in prio_map.items():
                         if almost_equal_rgb(col, rgb, tol=color_tol): matched = prname; break
@@ -285,7 +282,7 @@ def process(pdf_path, color_map, cut_col, group_col, zoom, qual, max_clozes, tol
     except Exception as e: return None, str(e)
     
     analysis = analyze_pages(reader, 1, len(reader.pages), color_map, cut_col, group_col, max_clozes, tol)
-    if not analysis: return None, "No highlights found."
+    if not analysis: return None, "有効なハイライトが見つかりませんでした。"
     
     deck_name = Path(pdf_path).stem
     deck = genanki.Deck(2059408600, deck_name)
@@ -297,22 +294,35 @@ def process(pdf_path, color_map, cut_col, group_col, zoom, qual, max_clozes, tol
     dpi = int(zoom*72)
     media_files = []
     
-    # Process
+    # ★修正ポイント: 全体のカード作成順をカウント
+    global_card_seq = 0
+    
     print(f"Converting {len(analysis)} pages...")
     with tempfile.TemporaryDirectory() as temp_media_dir:
-        for pi, info in analysis.items():
+        # ★修正ポイント: ページ番号順に確実にソートして処理
+        for pi, info in sorted(analysis.items()):
             base = render_page_pil(pdf, pi-1, dpi)
             scale = base.height / info["page_h"]
             for seg, full, chunks_info in info["segments"]:
                 crop = base.crop(pdf_to_pil_box(seg, info["page_h"], scale))
                 base_rgba = crop.convert("RGBA")
+                
                 for prio, chunk in chunks_info:
                     front, back = make_overlaid_images(base_rgba, seg, full, chunk, info["page_h"], scale)
-                    uid = uuid.uuid4().hex[:8]
-                    fname_f = f"{uid}_Q.jpg"; fname_b = f"{uid}_A.jpg"
+                    
+                    # ★修正ポイント: ファイル名を連番にする
+                    # 例: deckname_p001_00001_Q.jpg
+                    # これによりAnkiがファイル名順にソートしても順番が守られる
+                    global_card_seq += 1
+                    safe_deck_name = "".join(c for c in deck_name if c.isalnum())
+                    fname_base = f"{safe_deck_name}_p{pi:03d}_{global_card_seq:05d}"
+                    fname_f = f"{fname_base}_Q.jpg"
+                    fname_b = f"{fname_base}_A.jpg"
+                    
                     pf = os.path.join(temp_media_dir, fname_f); pb = os.path.join(temp_media_dir, fname_b)
                     front.convert("RGB").save(pf, quality=qual); back.convert("RGB").save(pb, quality=qual)
                     media_files.append(pf); media_files.append(pb)
+                    
                     deck.add_note(genanki.Note(model=model, fields=[f'<img src="{fname_f}">', f'<img src="{fname_b}">', str(pi), prio]))
         
         pdf.close()
