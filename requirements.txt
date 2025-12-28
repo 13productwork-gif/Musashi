@@ -1,0 +1,5 @@
+streamlit
+pypdf
+pypdfium2
+genanki
+Pillow
