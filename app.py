@@ -1,6 +1,6 @@
 # musashi_core.py
 # Goodnotes to Anki Logic Core (Headless for Colab)
-# v1.1: Fixed sorting order (sequential filenames)
+# v1.2: Expanded fields & Group override max_clozes
 
 import sys, subprocess, importlib, io, os, logging, tempfile, uuid, base64
 from typing import List, Tuple, Dict
@@ -133,7 +133,6 @@ def reading_sort_key(r: SimpleRect, page_h: float, rotation: int, row_pct: float
 
 # --- Main Analysis Logic ---
 def analyze_pages(reader, s_page, l_page, color_hex_map, cut_hl_color, group_ink_color, max_clozes, color_tol):
-    # (省略なしで全ロジックを保持します)
     HL_SORT_ROW_PCT = 0.035
     prio_map = {}
     for hx, pr in color_hex_map.items():
@@ -232,7 +231,8 @@ def analyze_pages(reader, s_page, l_page, color_hex_map, cut_hl_color, group_ink
                     if point_in_rect(cx, cy, g): group_bins[gi].append((r,p)); assigned = True; break
                 if not assigned: ungrouped.append((r,p))
 
-            def make_chunks(items):
+            # ★改良: force_single_card フラグを追加
+            def make_chunks(items, force_single_card=False):
                 if not items: return [], []
                 grouped_local = {}
                 for r,p in items: grouped_local.setdefault(p, []).append(r)
@@ -240,21 +240,31 @@ def analyze_pages(reader, s_page, l_page, color_hex_map, cut_hl_color, group_ink
                     grouped_local[p] = merge_rects_simple(grouped_local[p])
                     grouped_local[p].sort(key=lambda r: reading_sort_key(r, ph, rot, HL_SORT_ROW_PCT))
                 full_local = [r for lst in grouped_local.values() for r in lst]
+                
                 chunks_with_key = []
                 for p, lst in grouped_local.items():
-                    for i in range(0, len(lst), max_clozes):
-                        sub = lst[i:i+max_clozes]
+                    # グループ化されている場合(force_single_card=True)は、分割せずに丸ごと1チャンクにする
+                    step = len(lst) if force_single_card else max_clozes
+                    step = max(1, step)
+                    
+                    for i in range(0, len(lst), step):
+                        sub = lst[i:i+step]
                         if not sub: continue
                         key = reading_sort_key(sub[0], ph, rot, HL_SORT_ROW_PCT)
                         chunks_with_key.append((p, sub, key))
+                        
                 chunks_with_key.sort(key=lambda x: x[2])
                 return full_local, [(p, sub) for (p,sub,k) in chunks_with_key]
 
+            # 1. Groups (Gold) -> 制限無視 (force_single_card=True)
             for bin_items in group_bins:
-                full_l, chunks_l = make_chunks(bin_items)
+                full_l, chunks_l = make_chunks(bin_items, force_single_card=True)
                 if chunks_l: info["segments"].append((seg, full_l, chunks_l))
-            full_u, chunks_u = make_chunks(ungrouped)
+            
+            # 2. Ungrouped -> 制限あり (force_single_card=False)
+            full_u, chunks_u = make_chunks(ungrouped, force_single_card=False)
             if chunks_u: info["segments"].append((seg, full_u, chunks_u))
+
         if info["segments"]: res[pi] = info
     return res
 
@@ -286,20 +296,56 @@ def process(pdf_path, color_map, cut_col, group_col, zoom, qual, max_clozes, tol
     
     deck_name = Path(pdf_path).stem
     deck = genanki.Deck(2059408600, deck_name)
-    model = genanki.Model(1607398600, 'ImgCloze_Musashi',
-        fields=[{'name':'QImage'}, {'name':'AImage'}, {'name':'Page'}, {'name':'Priority'}],
-        templates=[{'name':'Card', 'qfmt': '{{QImage}}', 'afmt': '{{AImage}}<br><div style="text-align:center;color:#888;">p.{{Page}} / {{Priority}}</div>'}],
-        css='img { max-width: 100%; height: auto; }')
+    
+    # ★改良: モデルフィールドの拡張
+    model_fields = [
+        {'name':'ヘッダー'}, 
+        {'name':'重要度'}, 
+        {'name':'ページ番号'},
+        {'name':'表面（質問）'}, 
+        {'name':'裏面（答え）'},
+        {'name':'追加画像（表面）'}, 
+        {'name':'追加画像（裏面）'}, 
+        {'name':'音声（表面）'}, 
+        {'name':'音声（裏面）'}, 
+        {'name':'コメント'}
+    ]
+    
+    model = genanki.Model(
+        1607398600, 
+        'ImgCloze_Musashi_v2', 
+        fields=model_fields,
+        templates=[{
+            'name':'Card', 
+            'qfmt': '''
+                <div style="text-align:center">
+                    <strong>{{ヘッダー}}</strong><br>
+                    {{表面（質問）}}<br>
+                    {{追加画像（表面）}}<br>
+                    {{音声（表面）}}
+                </div>
+            ''', 
+            'afmt': '''
+                <div style="text-align:center">
+                    <strong>{{ヘッダー}}</strong><br>
+                    {{裏面（答え）}}<br>
+                    {{追加画像（裏面）}}<br>
+                    {{音声（裏面）}}<br>
+                    <hr>
+                    <div style="color:#888;">p.{{ページ番号}} / {{重要度}}</div>
+                    <div style="color:#2a2;">{{コメント}}</div>
+                </div>
+            '''
+        }],
+        css='img { max-width: 100%; height: auto; }'
+    )
     
     dpi = int(zoom*72)
     media_files = []
-    
-    # ★修正ポイント: 全体のカード作成順をカウント
     global_card_seq = 0
     
     print(f"Converting {len(analysis)} pages...")
     with tempfile.TemporaryDirectory() as temp_media_dir:
-        # ★修正ポイント: ページ番号順に確実にソートして処理
         for pi, info in sorted(analysis.items()):
             base = render_page_pil(pdf, pi-1, dpi)
             scale = base.height / info["page_h"]
@@ -310,9 +356,6 @@ def process(pdf_path, color_map, cut_col, group_col, zoom, qual, max_clozes, tol
                 for prio, chunk in chunks_info:
                     front, back = make_overlaid_images(base_rgba, seg, full, chunk, info["page_h"], scale)
                     
-                    # ★修正ポイント: ファイル名を連番にする
-                    # 例: deckname_p001_00001_Q.jpg
-                    # これによりAnkiがファイル名順にソートしても順番が守られる
                     global_card_seq += 1
                     safe_deck_name = "".join(c for c in deck_name if c.isalnum())
                     fname_base = f"{safe_deck_name}_p{pi:03d}_{global_card_seq:05d}"
@@ -323,7 +366,19 @@ def process(pdf_path, color_map, cut_col, group_col, zoom, qual, max_clozes, tol
                     front.convert("RGB").save(pf, quality=qual); back.convert("RGB").save(pb, quality=qual)
                     media_files.append(pf); media_files.append(pb)
                     
-                    deck.add_note(genanki.Note(model=model, fields=[f'<img src="{fname_f}">', f'<img src="{fname_b}">', str(pi), prio]))
+                    # Note作成（拡張フィールド対応）
+                    note = genanki.Note(
+                        model=model,
+                        fields=[
+                            deck_name,          # ヘッダー
+                            prio,               # 重要度
+                            str(pi),            # ページ番号
+                            f'<img src="{fname_f}">', # 表面画像
+                            f'<img src="{fname_b}">', # 裏面画像
+                            '', '', '', '', ''  # 追加フィールドは空で初期化
+                        ]
+                    )
+                    deck.add_note(note)
         
         pdf.close()
         pkg = genanki.Package(deck); pkg.media_files = media_files
