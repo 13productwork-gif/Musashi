@@ -1,85 +1,36 @@
-import streamlit as st
-import sys, subprocess, importlib
-import io, os, logging, tempfile, uuid
+# musashi_core.py
+# Goodnotes to Anki Logic Core (Headless for Colab)
+
+import sys, subprocess, importlib, io, os, logging, tempfile, uuid, base64
 from typing import List, Tuple, Dict
 from pathlib import Path
+
+# 必要なライブラリがなければインストールする機能
+def install_deps():
+    required = ["pypdf", "pypdfium2", "genanki", "Pillow"]
+    for pkg in required:
+        try:
+            importlib.import_module(pkg if pkg != "Pillow" else "PIL")
+        except ImportError:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+
+install_deps()
+
+import pypdf
+import pypdfium2 as pdfium
 from PIL import Image, ImageDraw
+import genanki
 
-# --- 必須ライブラリのチェックとインストール ---
-try:
-    import pypdf
-    import pypdfium2 as pdfium
-    import genanki
-except ImportError:
-    st.error("ライブラリが見つかりません。requirements.txtを確認してください。")
-    st.stop()
+# --- Constants & Helpers ---
+COLOR_TOL = 10
+CUT_MERGE_GAP = 6.0
+HL_SORT_ROW_PCT = 0.035
 
-# ===========================================================
-# 0) セキュリティ設定
-# ===========================================================
-def check_password():
-    password = st.text_input("パスワードを入力してください", type="password")
-    if password == "musashi123":
-        return True
-    return False
-
-# ===========================================================
-# 1) UI & Config
-# ===========================================================
-st.set_page_config(page_title="Goodnotes to Anki Converter", layout="wide")
-
-if not check_password():
-    st.stop()
-
-st.title("Goodnotes × Anki 自動変換ツール 'Musashi'")
-st.markdown("""
-PDFをアップロードすると、ハイライト（およびハイライト色のペン）を自動で穴埋めカードに変換します。
-- **緑**: 重要度High
-- **ピンク**: 重要度Medium
-- **黄色**: 重要度Low
-- **水色**: ページ分割線 (#cut)
-- **金(黄土色)**: 囲みグルーピング
-""")
-
-# サイドバー設定
-with st.sidebar:
-    st.header("設定")
-    zoom_factor = st.slider("画質 (Zoom)", 1, 4, 2)
-    jpeg_quality = st.slider("JPEG圧縮率", 40, 95, 70)
-    max_clozes = st.slider("1カードあたりの最大穴埋め数", 1, 8, 4)
-    
-    st.subheader("検出感度")
-    color_tol = st.slider("色の許容誤差", 0, 30, 10, help="色が認識されない場合は数値を上げてください")
-
-    with st.expander("カラー設定 (HEX)"):
-        color_high = st.color_picker("High (緑)", "#31FC85")
-        color_mid = st.color_picker("Mid (ピンク)", "#FF58C4")
-        color_low = st.color_picker("Low (黄)", "#FFFF10")
-        cut_hl_color = st.color_picker("Cut Line (水色)", "#00FFFF")
-        group_ink_color = st.color_picker("Group Ink (金)", "#FFD700")
-
-    MODEL_ID = 1607398600
-    DECK_ID = 2059408600
-
-# ===========================================================
-# 2) Helpers (Logic from Colab)
-# ===========================================================
 def hz(hx:str)->str: return (hx or "").lstrip("#")
 def hex_to_rgb_frac(hx:str)->Tuple[float,float,float]:
     c = hz(hx); return (int(c[0:2],16)/255, int(c[2:4],16)/255, int(c[4:6],16)/255)
 def almost_equal_rgb(a:Tuple[int,int,int], b:Tuple[int,int,int], tol:int=3)->bool:
     return abs(a[0]-b[0])<=tol and abs(a[1]-b[1])<=tol and abs(a[2]-b[2])<=tol
-def rgb01_to_255(seq):
-    if not seq: return (0,0,0)
-    out=[]
-    for c in seq[:3]:
-        try: f = float(c)
-        except Exception: f = 0.0
-        if f>1.001: v = int(round(min(max(f, 0.0), 255.0)))
-        else:       v = int(round(min(max(f, 0.0), 1.0)*255.0))
-        out.append(v)
-    while len(out)<3: out.append(0)
-    return tuple(out[:3])
 
 class SimpleRect:
     __slots__=("x0","y0","x1","y1")
@@ -113,7 +64,18 @@ def resolve(obj):
     except Exception: pass
     return obj
 
-# ★Colab版のハイライト形状判定ロジック
+def rgb01_to_255(seq):
+    if not seq: return (0,0,0)
+    out=[]
+    for c in seq[:3]:
+        try: f = float(c)
+        except Exception: f = 0.0
+        if f>1.001: v = int(round(min(max(f, 0.0), 255.0)))
+        else:       v = int(round(min(max(f, 0.0), 1.0)*255.0))
+        out.append(v)
+    while len(out)<3: out.append(0)
+    return tuple(out[:3])
+
 def looks_like_highlight(rect: SimpleRect, page_h: float, rotation: int, aspect_min: float = 0.10, max_height_ratio: float = 0.20) -> bool:
     w = max(1e-6, rect.x1-rect.x0); h = max(1e-6, rect.y1-rect.y0)
     if rotation in (0, 180):
@@ -121,7 +83,6 @@ def looks_like_highlight(rect: SimpleRect, page_h: float, rotation: int, aspect_
     else:
         return (h/w >= aspect_min) or (w <= page_h*max_height_ratio)
 
-# ★Colab版のInk座標取得ロジック（Border対応）
 def rects_from_ink(annot, default_padding=2.0) -> List[SimpleRect]:
     rects=[]
     inklist = resolve(annot.get("/InkList")) or []
@@ -130,16 +91,12 @@ def rects_from_ink(annot, default_padding=2.0) -> List[SimpleRect]:
     if isinstance(bs, dict) and bs.get("/W") is not None:
         try: w = float(bs.get("/W"))
         except Exception: pass
-    
-    # Border属性のチェック（Colab版のロジック）
     if w is None:
         border = resolve(annot.get("/Border"))
         if isinstance(border, list) and len(border)>=3:
             try: w = float(border[2])
             except Exception: pass
-            
     pad = (w or 0)/2.0 if w else default_padding
-    
     for path in inklist:
         try:
             xs = [float(path[i]) for i in range(0, len(path), 2)]
@@ -150,10 +107,7 @@ def rects_from_ink(annot, default_padding=2.0) -> List[SimpleRect]:
     return rects
 
 def pdf_to_pil_box(r: SimpleRect, page_h: float, scale: float) -> Tuple[int,int,int,int]:
-    return (int(round(r.x0*scale)),
-            int(round((page_h - r.y1)*scale)),
-            int(round(r.x1*scale)),
-            int(round((page_h - r.y0)*scale)))
+    return (int(round(r.x0*scale)), int(round((page_h - r.y1)*scale)), int(round(r.x1*scale)), int(round((page_h - r.y0)*scale)))
 
 def rect_to_local_box(r: SimpleRect, seg: SimpleRect, page_h: float, scale: float, w: int, h: int) -> Tuple[int,int,int,int]:
     abs_r  = pdf_to_pil_box(r,   page_h, scale)
@@ -170,7 +124,7 @@ def inflate_rect(r: SimpleRect, m: float) -> SimpleRect:
 def point_in_rect(x: float, y: float, r: SimpleRect) -> bool:
     return (r.x0 <= x <= r.x1) and (r.y0 <= y <= r.y1)
 
-def reading_sort_key(r: SimpleRect, page_h: float, rotation: int, row_pct: float=0.035):
+def reading_sort_key(r: SimpleRect, page_h: float, rotation: int, row_pct: float):
     cx, cy = rect_center(r)
     bucket = max(1.0, page_h * max(0.001, row_pct))
     if rotation in (0, 180):
@@ -180,23 +134,12 @@ def reading_sort_key(r: SimpleRect, page_h: float, rotation: int, row_pct: float
         col = int(round(cx / bucket))
         return (col, -(cy))
 
-# ===========================================================
-# 3) Analysis Logic (★移植手術のメイン部分)
-# ===========================================================
-def analyze_pages_for_cards_pypdf(
-    reader: pypdf.PdfReader,
-    s_page: int, l_page: int,
-    color_hex_map: Dict[str,str],
-    cut_hl_color: str,
-    group_ink_color: str,
-    max_clozes: int,
-    color_tol: int,
-):
+# --- Main Analysis Logic ---
+def analyze_pages(reader, s_page, l_page, color_hex_map, cut_hl_color, group_ink_color, max_clozes, color_tol):
     prio_map = {}
     for hx, pr in color_hex_map.items():
         r,g,b = [int(v*255) for v in hex_to_rgb_frac(hx)]
         prio_map[(r,g,b)] = pr
-    
     cut_hl_rgb = tuple(int(v*255) for v in hex_to_rgb_frac(cut_hl_color))
     group_ink_rgb = tuple(int(v*255) for v in hex_to_rgb_frac(group_ink_color))
     
@@ -221,70 +164,51 @@ def analyze_pages_for_cards_pypdf(
                 subtype = a.get("/Subtype")
                 col = rgb01_to_255(resolve(a.get("/C")))
 
-                # --- 1. Highlight注釈 (通常のPDFハイライト) ---
+                # Highlight
                 if subtype == "/Highlight":
                     qp = resolve(a.get("/QuadPoints")) or []
                     rects=[]
                     if qp:
                         for q in range(0, len(qp), 8):
-                            xs = [float(qp[j]) for j in (0,2,4,6)]
-                            ys_ = [float(qp[j]) for j in (1,3,5,7)]
+                            xs = [float(qp[j]) for j in (0,2,4,6)]; ys_ = [float(qp[j]) for j in (1,3,5,7)]
                             rects.append(SimpleRect(min(xs), min(ys_), max(xs), max(ys_)))
                     else:
                         rct = resolve(a.get("/Rect"))
                         if rct and len(rct)>=4:
                             rects = [SimpleRect(float(rct[0]), float(rct[1]), float(rct[2]), float(rct[3]))]
-                    
                     if not rects: continue
 
                     if almost_equal_rgb(col, cut_hl_rgb, tol=color_tol):
-                        cut_rects_hl.extend(merge_rects_simple(rects))
-                        continue
+                        cut_rects_hl.extend(merge_rects_simple(rects)); continue
 
                     matched = None
                     for rgb, prname in prio_map.items():
-                        if almost_equal_rgb(col, rgb, tol=color_tol):
-                            matched = prname; break
+                        if almost_equal_rgb(col, rgb, tol=color_tol): matched = prname; break
                     if matched:
                         for mr in merge_rects_simple(rects):
-                            if looks_like_highlight(mr, ph, rot):
-                                seg_annots.append((mr, matched))
+                            if looks_like_highlight(mr, ph, rot): seg_annots.append((mr, matched))
                         continue
 
-                # --- 2. Ink注釈 (Goodnotesのペン・蛍光ペン) ---
+                # Ink
                 if subtype == "/Ink":
                     rects = rects_from_ink(a)
                     if not rects: continue
-
-                    # A) グルーピング (金) - 最優先
                     if almost_equal_rgb(col, group_ink_rgb, tol=color_tol):
-                        for mr in merge_rects_simple(rects):
-                            group_rects_ink.append(inflate_rect(mr, 3.0))
+                        for mr in merge_rects_simple(rects): group_rects_ink.append(inflate_rect(mr, 3.0))
                         continue
-                    
-                    # B) カットライン (水色)
                     if almost_equal_rgb(col, cut_hl_rgb, tol=color_tol):
                         for mr in merge_rects_simple(rects):
-                            # Inkの場合は形状チェックをして、横線っぽいものだけCutLineとみなす
-                            if looks_like_highlight(mr, ph, rot, aspect_min=1.2): 
-                                cut_rects_hl.append(mr)
+                            if looks_like_highlight(mr, ph, rot, aspect_min=1.2): cut_rects_hl.append(mr)
                         continue
-
-                    # C) ハイライトとして扱うインク (緑・ピンク・黄) ★ここが今回のキモ
                     matched = None
                     for rgb, prname in prio_map.items():
-                        if almost_equal_rgb(col, rgb, tol=color_tol):
-                            matched = prname; break
-                    
+                        if almost_equal_rgb(col, rgb, tol=color_tol): matched = prname; break
                     if matched:
-                        # Colabのロジック: 形状チェックを通ったものだけをハイライトとする
                         valid_rects = [r for r in rects if looks_like_highlight(r, ph, rot)]
                         if valid_rects:
-                            for mr in merge_rects_simple(valid_rects):
-                                seg_annots.append((mr, matched))
+                            for mr in merge_rects_simple(valid_rects): seg_annots.append((mr, matched))
                         continue
 
-        # Page Splitting (Cuts)
         ys = [ph, 0]
         if cut_rects_hl:
             cut_ys = [ (r.y1) for r in cut_rects_hl ]
@@ -292,225 +216,107 @@ def analyze_pages_for_cards_pypdf(
             cut_ys.sort(reverse=True)
             merged_ys = []
             for y in cut_ys:
-                if not merged_ys or abs(y - merged_ys[-1]) >= 6.0:
-                    merged_ys.append(y)
+                if not merged_ys or abs(y - merged_ys[-1]) >= 6.0: merged_ys.append(y)
             ys = [ph] + merged_ys + [0]
         
         info = {"segments": [], "page_h": ph}
-        
         for top, bot in zip(ys[:-1], ys[1:]):
             seg = SimpleRect(pl, bot, pr, top)
             in_seg = [x for x in seg_annots if x[0].intersects(seg)]
             if not in_seg: continue
 
-            # Grouping within segment
             applied_groups = [g for g in group_rects_ink if g.intersects(seg)]
-            if applied_groups:
-                applied_groups.sort(key=lambda r: reading_sort_key(r, ph, rot))
-            
-            group_bins = [[] for _ in applied_groups]
-            ungrouped = []
+            if applied_groups: applied_groups.sort(key=lambda r: reading_sort_key(r, ph, rot, HL_SORT_ROW_PCT))
+            group_bins = [[] for _ in applied_groups]; ungrouped = []
 
             for (r,p) in in_seg:
-                cx, cy = rect_center(r)
-                assigned = False
+                cx, cy = rect_center(r); assigned = False
                 for gi, g in enumerate(applied_groups):
-                    if point_in_rect(cx, cy, g):
-                        group_bins[gi].append((r,p))
-                        assigned = True; break
-                if not assigned:
-                    ungrouped.append((r,p))
+                    if point_in_rect(cx, cy, g): group_bins[gi].append((r,p)); assigned = True; break
+                if not assigned: ungrouped.append((r,p))
 
             def make_chunks(items):
                 if not items: return [], []
-                # マージ
                 grouped_local = {}
                 for r,p in items: grouped_local.setdefault(p, []).append(r)
                 for p in grouped_local:
                     grouped_local[p] = merge_rects_simple(grouped_local[p])
-                    grouped_local[p].sort(key=lambda r: reading_sort_key(r, ph, rot))
-                
+                    grouped_local[p].sort(key=lambda r: reading_sort_key(r, ph, rot, HL_SORT_ROW_PCT))
                 full_local = [r for lst in grouped_local.values() for r in lst]
-                
-                # チャンク化
                 chunks_with_key = []
                 for p, lst in grouped_local.items():
                     for i in range(0, len(lst), max_clozes):
                         sub = lst[i:i+max_clozes]
                         if not sub: continue
-                        key = reading_sort_key(sub[0], ph, rot)
+                        key = reading_sort_key(sub[0], ph, rot, HL_SORT_ROW_PCT)
                         chunks_with_key.append((p, sub, key))
-                
-                chunks_with_key.sort(key=lambda x: x[2]) # 読み順ソート
+                chunks_with_key.sort(key=lambda x: x[2])
                 return full_local, [(p, sub) for (p,sub,k) in chunks_with_key]
 
-            # 1. Groups
             for bin_items in group_bins:
                 full_l, chunks_l = make_chunks(bin_items)
                 if chunks_l: info["segments"].append((seg, full_l, chunks_l))
-            
-            # 2. Ungrouped
             full_u, chunks_u = make_chunks(ungrouped)
             if chunks_u: info["segments"].append((seg, full_u, chunks_u))
-            
-        if info["segments"]:
-            res[pi] = info
+        if info["segments"]: res[pi] = info
     return res
 
-def render_page_pil(pdf: pdfium.PdfDocument, idx0: int, dpi: int) -> Image.Image:
+def render_page_pil(pdf, idx0, dpi):
     page = pdf[idx0]
-    try:
-        return page.render(scale=dpi/72).to_pil()
-    finally:
-        page.close()
+    try: return page.render(scale=dpi/72).to_pil()
+    finally: page.close()
 
-def make_overlaid_images(base_rgba: Image.Image, seg: SimpleRect, full_rects, chunk_rects,
-                         page_h: float, scale: float):
+def make_overlaid_images(base_rgba, seg, full_rects, chunk_rects, page_h, scale):
     w, h = base_rgba.size
-    ov_front = Image.new("RGBA", (w,h))
-    ov_back  = Image.new("RGBA", (w,h))
-    d_f = ImageDraw.Draw(ov_front)
-    d_b = ImageDraw.Draw(ov_back)
-
-    # 答えの穴埋め色（ピンク系）
+    ov_front = Image.new("RGBA", (w,h)); ov_back = Image.new("RGBA", (w,h))
+    d_f = ImageDraw.Draw(ov_front); d_b = ImageDraw.Draw(ov_back)
     fill_ans = (255, 141, 142, 255)
-
     for r in chunk_rects:
-        box = rect_to_local_box(r, seg, page_h, scale, w, h)
-        d_f.rectangle(box, fill=fill_ans) # 表面は隠す
-
+        d_f.rectangle(rect_to_local_box(r, seg, page_h, scale, w, h), fill=fill_ans)
     ow = max(1, int(round(0.8*scale)))
     for drw in (d_f, d_b):
-        for r in full_rects:
-            box = rect_to_local_box(r, seg, page_h, scale, w, h)
-            drw.rectangle(box, outline=(0,0,0,255), width=ow)
+        for r in full_rects: drw.rectangle(rect_to_local_box(r, seg, page_h, scale, w, h), outline=(0,0,0,255), width=ow)
+    return Image.alpha_composite(base_rgba, ov_front), Image.alpha_composite(base_rgba, ov_back)
 
-    front = Image.alpha_composite(base_rgba, ov_front)
-    back  = Image.alpha_composite(base_rgba, ov_back)
-    return front, back
-
-# ===========================================================
-# 4) Main Processing
-# ===========================================================
-def process_pdf(
-    pdf_file,
-    color_hex_map, cut_hl_color, group_ink_color,
-    zoom_factor, jpeg_quality, max_clozes, color_tol
-):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-        tmp_pdf.write(pdf_file.getvalue())
-        tmp_pdf_path = tmp_pdf.name
-    
+def process(pdf_path, color_map, cut_col, group_col, zoom, qual, max_clozes, tol):
     try:
-        reader = pypdf.PdfReader(tmp_pdf_path)
-        pdf = pdfium.PdfDocument(tmp_pdf_path)
-    except Exception:
-        return None, "PDFを開けませんでした"
-
-    # 解析実行（Colabロジック統合版）
-    analysis = analyze_pages_for_cards_pypdf(
-        reader, 1, len(reader.pages),
-        color_hex_map, cut_hl_color, group_ink_color, max_clozes, color_tol
-    )
-
-    if not analysis:
-        return None, "有効なハイライト（またはペン）が見つかりませんでした。色の設定や許容誤差を確認してください。"
-
-    deck_name = Path(pdf_file.name).stem
-    deck = genanki.Deck(DECK_ID, deck_name)
+        reader = pypdf.PdfReader(pdf_path)
+        pdf = pdfium.PdfDocument(pdf_path)
+    except Exception as e: return None, str(e)
     
-    model = genanki.Model(
-        MODEL_ID, 'ImgCloze_Musashi',
+    analysis = analyze_pages(reader, 1, len(reader.pages), color_map, cut_col, group_col, max_clozes, tol)
+    if not analysis: return None, "No highlights found."
+    
+    deck_name = Path(pdf_path).stem
+    deck = genanki.Deck(2059408600, deck_name)
+    model = genanki.Model(1607398600, 'ImgCloze_Musashi',
         fields=[{'name':'QImage'}, {'name':'AImage'}, {'name':'Page'}, {'name':'Priority'}],
-        templates=[{
-            'name':'Card',
-            'qfmt': '{{QImage}}',
-            'afmt': '{{AImage}}<br><div style="text-align:center;color:#888;">p.{{Page}} / {{Priority}}</div>'
-        }],
-        css='img { max-width: 100%; height: auto; }'
-    )
-
-    media_files = []
-    dpi = int(zoom_factor*72)
+        templates=[{'name':'Card', 'qfmt': '{{QImage}}', 'afmt': '{{AImage}}<br><div style="text-align:center;color:#888;">p.{{Page}} / {{Priority}}</div>'}],
+        css='img { max-width: 100%; height: auto; }')
     
-    progress_bar = st.progress(0)
-    total_segments = sum(len(v["segments"]) for v in analysis.values())
-    processed_count = 0
-
+    dpi = int(zoom*72)
+    media_files = []
+    
+    # Process
+    print(f"Converting {len(analysis)} pages...")
     with tempfile.TemporaryDirectory() as temp_media_dir:
         for pi, info in analysis.items():
             base = render_page_pil(pdf, pi-1, dpi)
             scale = base.height / info["page_h"]
-            
-            for seg_idx, (seg, full, chunks_info) in enumerate(info["segments"]):
+            for seg, full, chunks_info in info["segments"]:
                 crop = base.crop(pdf_to_pil_box(seg, info["page_h"], scale))
                 base_rgba = crop.convert("RGBA")
-                
-                for chunk_idx, (prio, chunk) in enumerate(chunks_info):
+                for prio, chunk in chunks_info:
                     front, back = make_overlaid_images(base_rgba, seg, full, chunk, info["page_h"], scale)
-                    
-                    unique_id = uuid.uuid4().hex[:8]
-                    fname_f = f"{unique_id}_Q.jpg"
-                    fname_b = f"{unique_id}_A.jpg"
-                    path_f = os.path.join(temp_media_dir, fname_f)
-                    path_b = os.path.join(temp_media_dir, fname_b)
-                    
-                    front.convert("RGB").save(path_f, quality=jpeg_quality)
-                    back.convert("RGB").save(path_b, quality=jpeg_quality)
-                    
-                    media_files.append(path_f)
-                    media_files.append(path_b)
-
-                    note = genanki.Note(
-                        model=model,
-                        fields=[
-                            f'<img src="{fname_f}">',
-                            f'<img src="{fname_b}">',
-                            str(pi),
-                            prio
-                        ]
-                    )
-                    deck.add_note(note)
-                
-                processed_count += 1
-                progress_bar.progress(min(processed_count / total_segments, 1.0))
+                    uid = uuid.uuid4().hex[:8]
+                    fname_f = f"{uid}_Q.jpg"; fname_b = f"{uid}_A.jpg"
+                    pf = os.path.join(temp_media_dir, fname_f); pb = os.path.join(temp_media_dir, fname_b)
+                    front.convert("RGB").save(pf, quality=qual); back.convert("RGB").save(pb, quality=qual)
+                    media_files.append(pf); media_files.append(pb)
+                    deck.add_note(genanki.Note(model=model, fields=[f'<img src="{fname_f}">', f'<img src="{fname_b}">', str(pi), prio]))
         
         pdf.close()
-        
-        package = genanki.Package(deck)
-        package.media_files = media_files
-        
-        out_apkg_path = os.path.join(tempfile.gettempdir(), f"{deck_name}.apkg")
-        package.write_to_file(out_apkg_path)
-        
-        with open(out_apkg_path, "rb") as f:
-            apkg_bytes = f.read()
-            
-    return apkg_bytes, None
-
-# ===========================================================
-# 5) Main Run
-# ===========================================================
-uploaded_file = st.file_uploader("PDFファイルをアップロード", type=["pdf"])
-
-if uploaded_file:
-    if st.button("変換開始"):
-        with st.spinner("解析中..."):
-            # Colab版のロジックを反映し、インクも検出対象とする
-            cmap = {color_high:"High", color_mid:"Mid", color_low:"Low"}
-            
-            apkg_data, err = process_pdf(
-                uploaded_file, cmap, cut_hl_color, group_ink_color,
-                zoom_factor, jpeg_quality, max_clozes, color_tol
-            )
-            
-            if err:
-                st.error(err)
-            else:
-                st.success("変換完了！")
-                st.download_button(
-                    label="Ankiデッキ(.apkg)をダウンロード",
-                    data=apkg_data,
-                    file_name=f"{Path(uploaded_file.name).stem}_musashi.apkg",
-                    mime="application/octet-stream"
-                )
+        pkg = genanki.Package(deck); pkg.media_files = media_files
+        out_path = f"/content/{deck_name}.apkg"
+        pkg.write_to_file(out_path)
+        return out_path, None
