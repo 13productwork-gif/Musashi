@@ -1,6 +1,6 @@
 # musashi_core.py
 # Goodnotes to Anki Logic Core (Headless for Colab)
-# v1.2: Expanded fields & Group override max_clozes
+# v1.3: New Model ID to force template update for Audio
 
 import sys, subprocess, importlib, io, os, logging, tempfile, uuid, base64
 from typing import List, Tuple, Dict
@@ -231,7 +231,6 @@ def analyze_pages(reader, s_page, l_page, color_hex_map, cut_hl_color, group_ink
                     if point_in_rect(cx, cy, g): group_bins[gi].append((r,p)); assigned = True; break
                 if not assigned: ungrouped.append((r,p))
 
-            # ★改良: force_single_card フラグを追加
             def make_chunks(items, force_single_card=False):
                 if not items: return [], []
                 grouped_local = {}
@@ -243,7 +242,6 @@ def analyze_pages(reader, s_page, l_page, color_hex_map, cut_hl_color, group_ink
                 
                 chunks_with_key = []
                 for p, lst in grouped_local.items():
-                    # グループ化されている場合(force_single_card=True)は、分割せずに丸ごと1チャンクにする
                     step = len(lst) if force_single_card else max_clozes
                     step = max(1, step)
                     
@@ -256,12 +254,12 @@ def analyze_pages(reader, s_page, l_page, color_hex_map, cut_hl_color, group_ink
                 chunks_with_key.sort(key=lambda x: x[2])
                 return full_local, [(p, sub) for (p,sub,k) in chunks_with_key]
 
-            # 1. Groups (Gold) -> 制限無視 (force_single_card=True)
+            # 1. Groups (Gold) -> 制限無視
             for bin_items in group_bins:
                 full_l, chunks_l = make_chunks(bin_items, force_single_card=True)
                 if chunks_l: info["segments"].append((seg, full_l, chunks_l))
             
-            # 2. Ungrouped -> 制限あり (force_single_card=False)
+            # 2. Ungrouped -> 制限あり
             full_u, chunks_u = make_chunks(ungrouped, force_single_card=False)
             if chunks_u: info["segments"].append((seg, full_u, chunks_u))
 
@@ -297,7 +295,6 @@ def process(pdf_path, color_map, cut_col, group_col, zoom, qual, max_clozes, tol
     deck_name = Path(pdf_path).stem
     deck = genanki.Deck(2059408600, deck_name)
     
-    # ★改良: モデルフィールドの拡張
     model_fields = [
         {'name':'ヘッダー'}, 
         {'name':'重要度'}, 
@@ -311,9 +308,10 @@ def process(pdf_path, color_map, cut_col, group_col, zoom, qual, max_clozes, tol
         {'name':'コメント'}
     ]
     
+    # ★修正ポイント: MODEL_IDを変更 (末尾を1増やしました)
     model = genanki.Model(
-        1607398600, 
-        'ImgCloze_Musashi_v2', 
+        1607398601,  # <--- NEW ID
+        'ImgCloze_Musashi_v3', 
         fields=model_fields,
         templates=[{
             'name':'Card', 
@@ -366,7 +364,6 @@ def process(pdf_path, color_map, cut_col, group_col, zoom, qual, max_clozes, tol
                     front.convert("RGB").save(pf, quality=qual); back.convert("RGB").save(pb, quality=qual)
                     media_files.append(pf); media_files.append(pb)
                     
-                    # Note作成（拡張フィールド対応）
                     note = genanki.Note(
                         model=model,
                         fields=[
@@ -375,7 +372,7 @@ def process(pdf_path, color_map, cut_col, group_col, zoom, qual, max_clozes, tol
                             str(pi),            # ページ番号
                             f'<img src="{fname_f}">', # 表面画像
                             f'<img src="{fname_b}">', # 裏面画像
-                            '', '', '', '', ''  # 追加フィールドは空で初期化
+                            '', '', '', '', ''
                         ]
                     )
                     deck.add_note(note)
